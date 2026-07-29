@@ -1,0 +1,147 @@
+# Agent runtime configuration — SHAPE ONLY.
+#
+# This documents how a resilient model-provider chain is wired, not which
+# providers or models any particular lab uses. Fill in your own. Nothing here
+# names a real account, endpoint, or model tier.
+#
+# Secrets are never values in this file. Keys ending in `_ref` name an entry in
+# a mode-0600 credential file (see vars.example.yml -> credentials.file).
+
+model:
+  # The default the agent uses when nothing more specific applies.
+  # `auto` delegates model selection to the aggregating gateway below, which is
+  # what makes the chain resilient: the agent stops caring which upstream is
+  # currently healthy.
+  default: auto
+  provider: aggregator
+  context_length: 128000
+  max_tokens: 8192
+
+# -----------------------------------------------------------------------------
+# Provider chain
+# -----------------------------------------------------------------------------
+# The pattern: put ONE aggregating gateway in front of everything, expose it as
+# an OpenAI-compatible endpoint, and let the agent talk only to that. Failover
+# then becomes a gateway concern rather than agent logic — which matters,
+# because failover logic inside an agent is exercised exactly when the agent is
+# least able to reason about it.
+#
+# Two open-source pieces make this work well:
+#
+#   * CLIProxyAPI (`eceasy/cli-proxy-api`) — an OpenAI-compatible multiplexer.
+#     Register several upstream credentials, assign each a priority, and it
+#     serves whichever tier is healthy. A dashboard container is available
+#     separately for usage accounting.
+#
+#     Two things that are easy to get wrong:
+#       - Tiers only fail over to each other if they expose the SAME model
+#         identifiers. A fallback tier advertising different model names is not
+#         a fallback; requests for the primary's model simply fail.
+#       - Configuration is read at start. Edit, then restart the container, or
+#         you are debugging the old config.
+#
+#   * A self-hosted free-model gateway (for example a `freellmapi`-style
+#     service) — useful as a low-priority tail tier for bulk or non-critical
+#     work. Treat it as best-effort: rate limits are the normal case, not the
+#     exception, so it belongs below anything you depend on.
+#
+providers:
+
+  aggregator:
+    # OpenAI-compatible multiplexer. The agent's only model dependency.
+    kind: openai-compatible
+    base_url: "{{ agent_runtime.gateway_url }}/v1"
+    api_key_ref: aggregator_api_key
+    # Lower number wins. Tiers MUST share model identifiers to fail over.
+    priority: 1
+
+  bulk:
+    # Low-priority tail tier. Expect rate limiting; do not route critical work.
+    kind: openai-compatible
+    base_url: http://192.0.2.20:3010/v1
+    api_key_ref: bulk_api_key
+    priority: 90
+
+  local:
+    # On-host or LAN model server. Slow but always available, and it does not
+    # depend on the internet being up — which is precisely when you need the
+    # agent most.
+    kind: openai-compatible
+    base_url: http://192.0.2.30:11434/v1
+    priority: 99
+
+# Ordered failover. Entries MUST be structured objects, not bare strings.
+#
+# This is a silent-failure config schema: a bare string here parses without
+# error and then never fails over, so the chain looks configured and is not.
+# Assert the shape at startup rather than documenting it — see doctrine on
+# configuration with silent failure modes.
+fallback_providers:
+  - provider: bulk
+    model: auto
+  - provider: local
+    model: auto
+
+# -----------------------------------------------------------------------------
+# Agent behavior
+# -----------------------------------------------------------------------------
+agent:
+  # Multi-step infrastructure work needs headroom. A ceiling that is too low
+  # presents as the agent "giving up" mid-task, which reads like a model
+  # problem and is not.
+  max_turns: {{ agent_runtime.max_turns }}
+
+  # Tool discovery over a network hop is slower than a local call. A timeout
+  # tuned for local tools makes remote tool servers look permanently down.
+  mcp_discovery_timeout: {{ agent_runtime.mcp_discovery_timeout }}
+
+  # Wall-clock ceiling, independent of any idle timer. A keepalive or streaming
+  # proxy resets idle counters, so an idle-based watchdog can never fire — the
+  # session hangs indefinitely while looking active.
+  session_max_seconds: 3600
+  gateway_timeout: 900
+
+  # Weak fallback models hallucinate tool names rather than admitting they
+  # cannot call a tool. Either keep the tail tier capable enough for tool use,
+  # or disable tools when the chain has degraded to it.
+  tool_use_enforcement: strict
+
+  parallel_tool_calls: true
+
+# -----------------------------------------------------------------------------
+# Notification
+# -----------------------------------------------------------------------------
+notify:
+  # Decisions and approvals only. No automated status reporting.
+  #
+  # This is a reliability control, not a style preference: an operator who
+  # receives routine success messages stops reading the channel, and then
+  # misses the one message that required them.
+  channel: "{{ notify.channel }}"
+  bot_token_ref: notify_bot_token
+  direct_chat_id_ref: notify_direct_chat_id
+  send_status_updates: false
+  send_decisions: true
+  # Verify any URL before sending it. A notification containing a dead link
+  # trains the operator to ignore notifications.
+  verify_links: true
+
+# -----------------------------------------------------------------------------
+# Work tracking
+# -----------------------------------------------------------------------------
+ticketing:
+  base_url: "{{ ticketing.base_url }}{{ ticketing.api_path }}"
+  api_user: "{{ ticketing.api_user }}"
+  api_password_ref: ticketing_api_password
+  # Every task opens with a search or a create, and multi-step work gets
+  # checkpoint notes as it goes. The checkpoints are the recovery contract: a
+  # quota cut-off, crash, or session rollover can interrupt mid-task, and the
+  # notes are what let any agent resume without re-deriving the work.
+  require_ticket_before_work: true
+  checkpoint_notes: true
+  # Checkpoints record what was done with evidence, what is verified true now,
+  # what is next, and what is blocking.
+  checkpoint_fields: [done, state, next, blockers]
+  # An automated audit that finds no work must return silence, not a report.
+  # Otherwise the audit becomes the noise it exists to detect.
+  silent_when_no_work: true

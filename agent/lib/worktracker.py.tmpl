@@ -1,0 +1,461 @@
+#!/usr/bin/env python3
+"""Work-tracking and documentation helper.
+
+Implements:
+    doctrine/operations/work-tracking-lifecycle.md
+    doctrine/knowledge/documentation-placement.md
+
+Speaks to two open-source stores:
+
+  * A Zammad-compatible work tracker (https://github.com/zammad/zammad) over
+    its REST API, for records, checkpoint notes, and handoff.
+  * An ITFlow-compatible documentation store
+    (https://github.com/itflow-org/itflow) for durable documentation.
+
+Standard library only.
+
+Why a helper rather than inline API calls at each site:
+
+  * The store's render contract lives in ONE place. ITFlow treats document
+    content as HTML, so Markdown written into it renders as literal asterisks -
+    the conversion belongs here, not at forty call sites.
+  * The tracker's search endpoint returns different response shapes depending on
+    query parameters. Parsing for the wrong shape reads as "no results" and
+    produces duplicate records. Handled once, below.
+  * Closing a record is deliberately NOT implemented. An agent must not mark its
+    own work verified.
+
+Usage:
+    python3 worktracker.py find "camera stream drops"
+    python3 worktracker.py open  "Camera stream drops on the east feed" --body "..."
+    python3 worktracker.py checkpoint <id> --done "..." --state "..." \
+                                          --next "..." --blockers "none"
+    python3 worktracker.py context "frigate"          # read docs before acting
+    python3 worktracker.py document "Service: NVR" --file notes.md
+    python3 worktracker.py handoff <id> --summary "..." --recommend "..."
+"""
+
+import argparse
+import base64
+import html
+import json
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import date
+
+# --- Rendered configuration -------------------------------------------------
+
+TRACKER_URL = "{{ ticketing.base_url }}{{ ticketing.api_path }}"
+TRACKER_USER = "{{ ticketing.api_user }}"
+TRACKER_PASSWORD_REF = "ticketing_api_password"
+TRACKER_GROUP = "{{ ticketing.group }}"
+HANDOFF_STATE = "{{ ticketing.handoff_state }}"
+VERIFIER = "{{ ticketing.verifier_user }}"
+
+DOCS_URL = "{{ documentation.base_url }}"
+DOCS_API_KEY_REF = "docs_api_key"
+DOCS_CLIENT_ID = "{{ documentation.client_id }}"
+
+CREDENTIALS_FILE = "{{ credentials.file }}"
+
+TIMEOUT = 30
+
+
+def resolve_ref(name):
+    """Read a secret from the mode-0600 credential file.
+
+    Secrets are never literals in configuration. One file to rotate, and
+    nothing sensitive in anything that might be synced or committed.
+    """
+    try:
+        with open(CREDENTIALS_FILE, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                if key.strip() == name:
+                    return value.strip()
+    except OSError as exc:
+        die("cannot read credential file %s: %s" % (CREDENTIALS_FILE, exc))
+    die("credential %r not found in %s" % (name, CREDENTIALS_FILE))
+
+
+def die(message):
+    print("worktracker: %s" % message, file=sys.stderr)
+    sys.exit(1)
+
+
+def request(url, method="GET", payload=None, headers=None):
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Content-Type", "application/json")
+    for key, value in (headers or {}).items():
+        req.add_header(key, value)
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
+            body = response.read().decode("utf-8")
+            return json.loads(body) if body.strip() else {}
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:400]
+        die("HTTP %s from %s: %s" % (exc.code, url, detail))
+    except urllib.error.URLError as exc:
+        die("cannot reach %s: %s" % (url, exc.reason))
+
+
+def tracker_request(path, method="GET", payload=None):
+    token = base64.b64encode(
+        ("%s:%s" % (TRACKER_USER, resolve_ref(TRACKER_PASSWORD_REF))).encode()
+    ).decode()
+    return request("%s%s" % (TRACKER_URL, path), method, payload,
+                   {"Authorization": "Basic %s" % token})
+
+
+# --- Stage 1: find or open a record -----------------------------------------
+
+def find(query, limit=20):
+    """Search the tracker. Returns a list of record dicts.
+
+    The response shape varies with query parameters: some return a bare array,
+    others a keyed object with an `assets` map. Parsing for the wrong one is
+    indistinguishable from an empty result set and leads straight to duplicate
+    records - so handle both.
+
+    A search that returns nothing is NOT proof of absence. Cross-check recent
+    records before concluding the subject is new.
+    """
+    path = "/tickets/search?%s" % urllib.parse.urlencode(
+        {"query": query, "limit": limit, "full": "true"})
+    result = tracker_request(path)
+
+    if isinstance(result, list):
+        return result
+    if isinstance(result, dict):
+        assets = result.get("assets", {}).get("Ticket")
+        if assets:
+            order = result.get("record_ids") or list(assets.keys())
+            return [assets[str(i)] for i in order if str(i) in assets]
+        if "tickets" in result:
+            return result["tickets"]
+    return []
+
+
+def open_record(title, body, group=None):
+    """Create a record whose opening entry is the request VERBATIM.
+
+    Do not paraphrase at intake. Summarizing loses the detail that turns out to
+    matter, and the wording is the operator's, not yours.
+    """
+    payload = {
+        "title": title,
+        "group": group or TRACKER_GROUP,
+        "customer": TRACKER_USER,
+        "article": {
+            "subject": "Request",
+            "body": body,
+            "type": "note",
+            "internal": False,
+        },
+    }
+    return tracker_request("/tickets", "POST", payload)
+
+
+# --- Stage 2: read the environment before diagnosing ------------------------
+
+def docs_request(path, method="GET", payload=None):
+    return request(
+        "%s%s" % (DOCS_URL.rstrip("/"), path), method, payload,
+        {"Authorization": "Bearer %s" % resolve_ref(DOCS_API_KEY_REF)})
+
+
+def context(subject):
+    """Gather what the environment already knows about a subject.
+
+    Read order is cheapest and most specific first: prior records, then durable
+    documentation, then the live system. Reverse it and you will re-derive a
+    solved problem from first principles.
+    """
+    prior = find(subject)
+    docs = doc_search(subject)
+    return {
+        "prior_records": [
+            {"id": t.get("id"), "number": t.get("number"), "title": t.get("title")}
+            for t in prior
+        ],
+        "documents": [
+            {"id": d.get("id"), "title": d.get("name") or d.get("title")}
+            for d in docs
+        ],
+    }
+
+
+def doc_search(subject):
+    result = docs_request("/documents?%s" % urllib.parse.urlencode(
+        {"search": subject, "client_id": DOCS_CLIENT_ID}))
+    if isinstance(result, list):
+        return result
+    return result.get("data", []) if isinstance(result, dict) else []
+
+
+# --- Stage 3: checkpoint while working --------------------------------------
+
+CHECKPOINT_TEMPLATE = """DONE:
+{done}
+
+STATE:
+{state}
+
+NEXT:
+{next_steps}
+
+BLOCKERS:
+{blockers}"""
+
+
+def checkpoint(record_id, done, state, next_steps, blockers="none"):
+    """Post a resumable checkpoint. Internal - working notes, not correspondence.
+
+    The test for a good checkpoint: could an agent with no memory of this
+    session read it and continue? "Investigating the mount issue" fails.
+    Concrete commands, paths, values, and an explicit next step pass.
+
+    Post after each meaningful step, and ALWAYS immediately before anything
+    long-running, quota-risky, or hard to reverse.
+    """
+    for label, value in (("done", done), ("state", state), ("next", next_steps)):
+        if not value or not value.strip():
+            die("checkpoint requires a non-empty %s section" % label)
+    body = CHECKPOINT_TEMPLATE.format(
+        done=done, state=state, next_steps=next_steps, blockers=blockers)
+    return note(record_id, "Checkpoint", body, internal=True)
+
+
+def note(record_id, subject, body, internal=True):
+    return tracker_request("/ticket_articles", "POST", {
+        "ticket_id": int(record_id),
+        "type": "note",
+        "internal": bool(internal),
+        "subject": subject,
+        "body": body,
+    })
+
+
+# --- Stage 4: write findings back to the documentation store ----------------
+#
+# Durable knowledge goes to the documentation store; what happened this time
+# goes to the record. Both, when the work produced both.
+
+QUICK_FACTS = re.compile(r"^([A-Z][^:\n]{2,40}):\s+(.*)$")
+
+
+def markdown_to_document(markdown):
+    """Convert Markdown to the canonical document HTML.
+
+    ITFlow renders document content as HTML, not Markdown. Owning the
+    conversion here means the contract is fixed in one place and every document
+    in the store comes out consistently structured:
+
+        Quick Facts (bold-label lines)  ->  Details sections  ->  Revision History
+    """
+    out, facts, in_facts = [], [], True
+    lines = markdown.strip().splitlines()
+
+    for raw in lines:
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+        heading = re.match(r"^(#{1,4})\s+(.*)$", line)
+        if heading:
+            in_facts = False
+            level = min(len(heading.group(1)) + 1, 5)
+            out.append("<h%d>%s</h%d>" % (level, html.escape(heading.group(2)), level))
+            continue
+        bullet = re.match(r"^[-*]\s+(.*)$", line)
+        if bullet:
+            in_facts = False
+            out.append("<li>%s</li>" % inline(bullet.group(1)))
+            continue
+        fact = QUICK_FACTS.match(line)
+        if in_facts and fact:
+            facts.append("<strong>%s:</strong> %s" % (
+                html.escape(fact.group(1)), inline(fact.group(2))))
+            continue
+        in_facts = False
+        out.append("<p>%s</p>" % inline(line))
+
+    body = wrap_lists(out)
+    head = ""
+    if facts:
+        head = "<h2>Quick Facts</h2>\n<p>%s</p>\n" % "<br>\n".join(facts)
+        body = "<h2>Details</h2>\n" + body
+
+    revision = (
+        "<h2>Revision History</h2>\n"
+        "<table border=\"1\" cellpadding=\"4\">\n"
+        "<tr><th>Date</th><th>Change</th></tr>\n"
+        "<tr><td>%s</td><td>Document created or updated by the operator agent.</td></tr>\n"
+        "</table>\n" % date.today().isoformat()
+    )
+    return head + body + revision
+
+
+def inline(text):
+    text = html.escape(text)
+    text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
+    text = re.sub(r"`(.+?)`", r"<code>\1</code>", text)
+    return text
+
+
+def wrap_lists(parts):
+    out, buffer = [], []
+    for part in parts:
+        if part.startswith("<li>"):
+            buffer.append(part)
+            continue
+        if buffer:
+            out.append("<ul>\n%s\n</ul>" % "\n".join(buffer))
+            buffer = []
+        out.append(part)
+    if buffer:
+        out.append("<ul>\n%s\n</ul>" % "\n".join(buffer))
+    return "\n".join(out) + "\n"
+
+
+def document(title, markdown):
+    """Create or update a document. ONE subject per document.
+
+    Search first and update the existing owner. A store with four overlapping
+    documents on one subject has no source of truth - it has four opinions of
+    unknown relative age.
+
+    Verify the RENDERED page the first time you write to a store. A 200 means
+    the store accepted bytes, not that a human can read them.
+    """
+    content = markdown_to_document(markdown)
+    existing = [d for d in doc_search(title)
+                if (d.get("name") or d.get("title") or "").strip().lower()
+                == title.strip().lower()]
+    payload = {"name": title, "content": content, "client_id": DOCS_CLIENT_ID}
+    if existing:
+        doc_id = existing[0].get("id")
+        print("updating existing document %s (%r)" % (doc_id, title))
+        return docs_request("/documents/%s" % doc_id, "PATCH", payload)
+    print("creating new document %r" % title)
+    return docs_request("/documents", "POST", payload)
+
+
+# --- Stage 5: hand off for verification -------------------------------------
+
+HANDOFF_TEMPLATE = """{summary}
+
+VERIFIED:
+{verified}
+
+NOT VERIFIED:
+{not_verified}
+
+RECOMMENDATION:
+{recommendation}"""
+
+
+def handoff(record_id, summary, verified, not_verified, recommendation):
+    """Transfer the record to the operator for verification.
+
+    Sets ownership and a state that awaits the operator. Deliberately does NOT
+    close: verification and execution must not be the same party, because the
+    agent's evidence of success is exactly what is under review.
+
+    `not_verified` is required and must not be empty. If everything really was
+    verified, say so explicitly - the field exists to stop an unverified
+    remainder from being silently omitted.
+    """
+    for label, value in (("summary", summary), ("verified", verified),
+                         ("not_verified", not_verified),
+                         ("recommendation", recommendation)):
+        if not value or not value.strip():
+            die("handoff requires a non-empty %s section" % label)
+
+    note(record_id, "Handoff for verification", HANDOFF_TEMPLATE.format(
+        summary=summary, verified=verified,
+        not_verified=not_verified, recommendation=recommendation), internal=False)
+
+    result = tracker_request("/tickets/%s" % int(record_id), "PUT", {
+        "state": HANDOFF_STATE,
+        "owner": VERIFIER,
+    })
+    print("record %s handed to %s in state %r - the operator verifies and closes"
+          % (record_id, VERIFIER, HANDOFF_STATE))
+    return result
+
+
+# --- CLI --------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("find", help="stage 1: search before creating")
+    p.add_argument("query")
+
+    p = sub.add_parser("open", help="stage 1: create a record")
+    p.add_argument("title")
+    p.add_argument("--body", required=True,
+                   help="the request VERBATIM - do not paraphrase")
+
+    p = sub.add_parser("context", help="stage 2: read prior records and docs")
+    p.add_argument("subject")
+
+    p = sub.add_parser("checkpoint", help="stage 3: resumable progress note")
+    p.add_argument("record_id")
+    p.add_argument("--done", required=True)
+    p.add_argument("--state", required=True)
+    p.add_argument("--next", required=True, dest="next_steps")
+    p.add_argument("--blockers", default="none")
+
+    p = sub.add_parser("document", help="stage 4: create or update documentation")
+    p.add_argument("title")
+    p.add_argument("--file", required=True, help="Markdown source, or - for stdin")
+
+    p = sub.add_parser("handoff", help="stage 5: transfer to the operator")
+    p.add_argument("record_id")
+    p.add_argument("--summary", required=True)
+    p.add_argument("--verified", required=True)
+    p.add_argument("--not-verified", required=True, dest="not_verified")
+    p.add_argument("--recommend", required=True, dest="recommendation")
+
+    args = parser.parse_args()
+
+    if args.command == "find":
+        records = find(args.query)
+        if not records:
+            print("no matches - search is not proof of absence; check recent "
+                  "records before creating")
+        for record in records:
+            print("%s  %s  %s" % (record.get("id"), record.get("number"),
+                                  record.get("title")))
+    elif args.command == "open":
+        record = open_record(args.title, args.body)
+        print("opened %s (%s)" % (record.get("number"), record.get("id")))
+    elif args.command == "context":
+        print(json.dumps(context(args.subject), indent=2))
+    elif args.command == "checkpoint":
+        checkpoint(args.record_id, args.done, args.state, args.next_steps,
+                   args.blockers)
+        print("checkpoint posted to %s" % args.record_id)
+    elif args.command == "document":
+        source = sys.stdin.read() if args.file == "-" else \
+            open(args.file, encoding="utf-8").read()
+        document(args.title, source)
+        print("now LOOK at the rendered page - a 200 is not legibility")
+    elif args.command == "handoff":
+        handoff(args.record_id, args.summary, args.verified, args.not_verified,
+                args.recommendation)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

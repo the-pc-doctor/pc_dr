@@ -1,0 +1,118 @@
+# Core stack — home automation, NVR, broker, metrics.
+#
+# Rendered by: python3 scripts/render.py --vars <private>/vars.yml --out <private>/rendered
+# Rendered output is private. Do not commit it.
+#
+# ARCHITECTURE CONSTRAINT: on single-board hardware, confirm every image has a
+# build for {{ hosts.core.arch }} before deploying. An image that only exists
+# for another architecture is not a plan. Some upstreams ship an
+# architecture-specific tag suffix rather than a multi-arch manifest — the NVR
+# below is one of them.
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Home automation. Named critical: people depend on it directly.
+  # ---------------------------------------------------------------------------
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:stable
+    container_name: homeassistant
+    restart: unless-stopped
+    # Host networking is required for device discovery protocols (mDNS, SSDP).
+    # It also means this container's ports are not isolated — deliberate, and a
+    # reason to keep the reverse proxy in front of anything reachable remotely.
+    network_mode: host
+    privileged: true
+    volumes:
+      - {{ lab.home_dir }}/homeassistant:/config
+      - /etc/localtime:/etc/localtime:ro
+      - /run/dbus:/run/dbus:ro
+    environment:
+      TZ: {{ lab.timezone }}
+    # Automations live in ONE file that the UI can edit. Split-directory
+    # includes break the UI edit path; see automation/ha/.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:{{ services.home_automation.port }}/manifest.json"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+
+  # ---------------------------------------------------------------------------
+  # Network video recorder. Named critical.
+  # ---------------------------------------------------------------------------
+  frigate:
+    image: ghcr.io/blakeblackshear/frigate:stable
+    container_name: frigate
+    restart: unless-stopped
+    privileged: true
+    shm_size: "256mb"
+    devices:
+      # Hardware decode and inference accelerators are platform-specific.
+      # Verify these device nodes exist on the host before enabling.
+      - /dev/dri/renderD128:/dev/dri/renderD128
+    volumes:
+      - {{ lab.home_dir }}/frigate/config:/config
+      - /etc/localtime:/etc/localtime:ro
+      # Recordings go to network storage. A stale or dropped mount presents as
+      # "recording stopped" with a healthy container — check the mount first.
+      - {{ hosts.storage.nfs_exports.recordings }}:/media/frigate
+    ports:
+      - "{{ services.nvr.port }}:5000"
+      - "8554:8554"   # rtsp restream
+      - "8555:8555"   # webrtc
+    environment:
+      TZ: {{ lab.timezone }}
+    depends_on:
+      - mosquitto
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5000/api/version"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  # ---------------------------------------------------------------------------
+  # MQTT broker. Shared dependency — a failure here looks like several
+  # unrelated integrations failing at once. See doctrine on blast radius.
+  # ---------------------------------------------------------------------------
+  mosquitto:
+    image: eclipse-mosquitto:latest
+    container_name: mosquitto
+    restart: unless-stopped
+    ports:
+      - "{{ services.mqtt.port }}:1883"
+    volumes:
+      - {{ lab.home_dir }}/mosquitto/config:/mosquitto/config
+      - {{ lab.home_dir }}/mosquitto/data:/mosquitto/data
+    environment:
+      TZ: {{ lab.timezone }}
+
+  # ---------------------------------------------------------------------------
+  # Time-series metrics. Retention is a storage-pressure control, not a
+  # preference — unbounded retention on a small disk is a future outage.
+  # ---------------------------------------------------------------------------
+  influxdb:
+    image: influxdb:2.7
+    container_name: influxdb
+    restart: unless-stopped
+    ports:
+      - "{{ services.metrics.port }}:8086"
+    volumes:
+      - {{ lab.home_dir }}/influxdb/data:/var/lib/influxdb2
+      - {{ lab.home_dir }}/influxdb/config:/etc/influxdb2
+    environment:
+      TZ: {{ lab.timezone }}
+
+# Deliberately not in this stack:
+#
+#   * The reverse proxy and auth gateway (nginx-proxy-manager, authelia) — they
+#     have a different restart risk profile and must survive a core-stack
+#     restart, because they are how you get back in.
+#   * The uptime monitor (uptime-kuma) — a monitor that shares a failure domain
+#     with what it monitors reports nothing at the moment you need it.
+#   * The agent runtime — see agent/.
+#
+# Separating these is the point. A single compose file for everything means one
+# `docker compose down` takes out your access path, your monitoring, and your
+# recovery tooling at the same time.

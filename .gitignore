@@ -1,0 +1,36 @@
+# Private denylist of real identifiers. Committing this would disclose
+# exactly the values it exists to exclude. See SANITIZATION.md.
+.denylist.local
+denylist.txt
+
+# Real variable values and anything rendered from them.
+vars.yml
+vars.*.yml
+!vars.example.yml
+rendered/
+out/
+
+# Credentials, keys, environment files.
+*.pem
+*.key
+*.p12
+*.crt
+.env
+.env.*
+*credentials*
+*secrets*
+auth.json
+
+# Live configuration accidentally dropped in the tree.
+*.bak
+*.bak.*
+*.orig
+*.live.yml
+*.live.yaml
+
+# Tooling noise.
+__pycache__/
+*.pyc
+.DS_Store
+._*
+.venv/

@@ -1,0 +1,142 @@
+# pc_dr — variable definitions
+#
+# Copy this file to your PRIVATE source tree, outside this repository, and fill
+# it in. Never commit a filled copy. See SANITIZATION.md.
+#
+#   cp vars.example.yml ../pc_dr-src/vars.yml
+#   chmod 600 ../pc_dr-src/vars.yml
+#
+# All addresses below are RFC 5737 documentation ranges and all domains are
+# RFC 2606 reserved names. A literal RFC 1918 address in this repository is a
+# check failure, including in examples — use the documentation ranges.
+#
+# SECRETS ARE NOT VALUES HERE. Keys ending in `_ref` name an entry in a
+# mode-0600 credential file. This keeps rotation in one place and keeps secrets
+# out of anything that might be synced, backed up, or committed.
+
+lab:
+  # Short identifier used in generated headers and unit descriptions.
+  name: examplelab
+  # Home directory of the operating user on the core host. Never a real
+  # username in this repository.
+  home_dir: /home/operator
+  operator_user: operator
+  timezone: Etc/UTC
+
+credentials:
+  # Path to the mode-0600 file that resolves every *_ref below.
+  # Format: one `key = value` per line.
+  file: /home/operator/.lab_credentials
+
+hosts:
+  # Core host: containers, agent runtime, watchdogs, scheduled maintenance.
+  core:
+    hostname: core.lab.example
+    ip: 192.0.2.10
+    # Hard constraint. Images without a matching build do not run here.
+    arch: arm64
+    user: operator
+    memory_gb: 8
+
+  # Network-attached storage: bulk media, recordings, backups, ticket system.
+  storage:
+    hostname: storage.lab.example
+    ip: 192.0.2.20
+    # Storage appliances often require a vendor-specific account that is not
+    # the same username as the core host. Verify before assuming.
+    user: storageuser
+    nfs_exports:
+      recordings: /volume1/recordings
+      backups: /volume1/backups
+
+  # Optional secondary host: media server, offload, or spare compute.
+  media:
+    hostname: media.lab.example
+    ip: 192.0.2.30
+    user: operator
+
+network:
+  gateway: 192.0.2.1
+  subnet: 192.0.2.0/24
+  # Externally resolvable name, if the lab is reachable from outside.
+  # Publishing this alongside a service inventory yields a target list.
+  external_domain: lab.example
+  internal_domain: lab.internal
+  # Overlay / mesh network, if used. Addresses in 100.64.0.0/10 are as
+  # identifying as public addresses and are denied in this repository.
+  overlay_enabled: false
+
+# Ports are upstream defaults. Overriding them is not security, but colliding
+# with them is an outage.
+services:
+  home_automation:   { port: 8123, critical: true }
+  nvr:               { port: 5000, critical: true }
+  reverse_proxy:     { admin_port: 81, http_port: 80, https_port: 443 }
+  auth_gateway:      { port: 9091 }
+  uptime_monitor:    { port: 3001 }
+  dashboard:         { port: 8080 }
+  metrics:           { port: 8086 }
+  mqtt:              { port: 1883 }
+  docs:              { port: 8090 }
+  container_manager: { port: 3552 }
+  agent_gateway:     { port: 8317 }
+
+# Services named here get resource protection, watchdog coverage, and
+# post-change verification. Ask the operator; do not infer this list.
+critical_services:
+  - home_automation
+  - nvr
+
+ticketing:
+  # Work-tracking system the agent files to. Every task starts with a search
+  # or a create; every multi-step task gets checkpoint notes.
+  # Zammad-compatible REST API — https://github.com/zammad/zammad
+  base_url: http://192.0.2.20:8080
+  api_path: /api/v1
+  api_user: agent@lab.example
+  api_password_ref: ticketing_api_password
+  # Group new records are filed under.
+  group: Users
+  # The human who verifies and closes. The agent hands off to this account and
+  # never closes a record itself: verification and execution must not be the
+  # same party, because the agent's evidence of success is what is under review.
+  verifier_user: operator@lab.example
+  # State the record is set to on handoff. Must be a state that awaits the
+  # operator rather than one that ends the record.
+  handoff_state: pending reminder
+
+documentation:
+  # Durable architecture documentation. Not for transient incident notes.
+  # ITFlow-compatible — https://github.com/itflow-org/itflow
+  # NOTE: ITFlow renders document content as HTML, not Markdown. Write through
+  # agent/lib/worktracker.py, which owns that conversion in one place.
+  base_url: https://lab.example/docs
+  api_key_ref: docs_api_key
+  client_id: 1
+
+notify:
+  # Decisions and approvals only. No automated status reporting — an operator
+  # who receives routine success messages stops reading all messages.
+  channel: telegram
+  bot_token_ref: notify_bot_token
+  direct_chat_id_ref: notify_direct_chat_id
+
+agent_runtime:
+  # See agent/config/agent-runtime.yaml.tmpl for the full shape.
+  gateway_url: http://192.0.2.10:8317
+  # Aggregating gateway in front of one or more model providers. Naming the
+  # gateway software is fine; naming your accounts and upstream models is not.
+  aggregator: cliproxy
+  max_turns: 60
+  mcp_discovery_timeout: 15
+
+backup:
+  # An unverified backup is a belief, not a backup.
+  destination: /volume1/backups
+  schedule: "0 3 * * 0"
+  retain_days: 30
+  verify: true
+
+maintenance:
+  host_schedule: "0 4 1 * *"      # monthly host package and image refresh
+  service_schedule: "0 2 * * 0"   # weekly per-service health pass
