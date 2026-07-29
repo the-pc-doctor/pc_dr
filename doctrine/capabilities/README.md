@@ -1,6 +1,10 @@
 # Doctrine — capabilities
 
-Model-provider failover, hardware architecture constraints, and governing
-external capabilities the lab depends on but does not control.
+What the system can actually do, and what it depends on but does not control.
 
-Phase 2. Empty on purpose.
+- `architecture-constraints.md` — verify the image exists for this CPU
+  architecture, know the memory ceiling, make reclaim precedence explicit.
+- `model-provider-failover.md` — put failover in a gateway, make tiers share
+  model identifiers, assert the shape of silent-failure configuration.
+- `external-capability-governance.md` — a capability you do not operate can be
+  withdrawn, throttled, or silently degraded; acceptance is not execution.
