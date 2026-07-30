@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""Session-stop / pre-compaction hook: post a deterministic checkpoint.
+
+Doctrine: doctrine/operations/work-tracking-lifecycle.md
+Skill:    agent/skills/work-lifecycle/SKILL.md
+
+WHY THIS EXISTS. The checkpoint contract is model-executed, so it degrades
+exactly when it is most needed — after a provider chain fails over to a weaker
+tier, or when the context is nearly full and about to be compacted. Those are
+the moments an interruption is most likely and a checkpoint most valuable.
+
+A hook is executed by the harness, so it fires identically no matter which model
+is behind the endpoint. It does NOT replace the agent's own semantic
+checkpoints; it writes a deterministic evidence trail — what ran, what changed,
+what errored — that a cold start can resume from.
+
+CONTRACT WITH THE HARNESS:
+  * stdin is a JSON object with session/transcript identifiers.
+  * ALWAYS exit 0. A checkpointer must never be able to break the work it is
+    recording. Every failure path below degrades to silence.
+  * stdout stays empty; nothing here should be fed back to the model.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+
+CRED_FILE = os.environ.get("LAB_CREDENTIALS", "{{ credentials.file }}")
+API_TIMEOUT = 8
+
+# Tools whose use means real work happened. Reading and record-posting alone
+# must not trigger a checkpoint, or every conversational turn spams the tracker
+# and the checkpoints stop being read.
+WORK_TOOLS = {"Bash", "Edit", "Write", "NotebookEdit", "Task", "Agent"}
+
+
+def _cred(key, default=""):
+    """Resolve a secret at runtime. Never raises — see the harness contract."""
+    try:
+        with open(CRED_FILE, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if "=" in line:
+                    name, value = line.split("=", 1)
+                    if name.strip() == key:
+                        return value.strip()
+    except OSError:
+        pass
+    return default
+
+
+TRACKER_BASE = _cred("ticketing_api_base")
+TRACKER_USER = _cred("ticketing_api_user")
+TRACKER_PASS = _cred("ticketing_api_password")
+TRACKER_AUTH = "%s:%s" % (TRACKER_USER, TRACKER_PASS) if TRACKER_PASS else ""
+
+# --- Redaction --------------------------------------------------------------
+#
+# Transcripts contain live credentials — `curl -u`, bearer tokens, API keys.
+# None of it may reach a record. FAIL CLOSED: when unsure, redact.
+#
+# This matters more than it looks. The checkpoint is quoting tool calls the
+# agent actually made, so any credential the agent handled in plaintext lands
+# here verbatim unless it is stripped.
+
+REDACTIONS = [
+    (re.compile(r"(-u\s+['\"]?[\w.@+-]+:)[^'\"\s]+"), r"\1<redacted>"),
+    (re.compile(r"(Bearer\s+)[A-Za-z0-9._~+/-]{12,}=*"), r"\1<redacted>"),
+    (re.compile(r"(sk-)[A-Za-z0-9._-]{12,}"), r"\1<redacted>"),
+    (re.compile(r"(AIza)[A-Za-z0-9_-]{10,}"), r"\1<redacted>"),
+    (re.compile(r"((?:api[_-]?key|password|passwd|secret|token)['\"]?\s*[:=]\s*['\"]?)"
+                r"[^'\"\s,}]{6,}", re.I), r"\1<redacted>"),
+]
+
+# Redact this hook's own credential too. Guarded: an unresolved password would
+# compile to an empty pattern that matches everywhere.
+if TRACKER_PASS:
+    REDACTIONS.append((re.compile(re.escape(TRACKER_PASS)), "<redacted>"))
+
+
+def redact(text):
+    if not text:
+        return ""
+    for pattern, replacement in REDACTIONS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def post(record_id, subject, body):
+    """Post the checkpoint. Silent on any failure."""
+    if not TRACKER_AUTH or not record_id:
+        return
+    payload = json.dumps({
+        "ticket_id": int(record_id),
+        "type": "note",
+        "internal": True,
+        "subject": subject,
+        "body": redact(body),
+    })
+    try:
+        subprocess.run(
+            [
+                "curl", "-s", "-o", "/dev/null", "--max-time", str(API_TIMEOUT),
+                # Credentials on stdin, never in argv: an argument is visible in
+                # `ps` to any local user.
+                "--config", "-", "-X", "POST",
+                "%s/ticket_articles" % TRACKER_BASE,
+                "-H", "Content-Type: application/json",
+                "-d", payload,
+            ],
+            input=('user = "%s"\n' % TRACKER_AUTH).encode(),
+            capture_output=True,
+            timeout=API_TIMEOUT + 4,
+        )
+    except (subprocess.SubprocessError, OSError, ValueError):
+        pass
+
+
+def build_body(facts, event_name):
+    """Render the four sections that make a checkpoint resumable.
+
+    A checkpoint that summarizes intent instead of evidence does not enable
+    resumption, and gives false confidence that it would.
+    """
+    done = "\n".join("- %s" % redact(f) for f in facts.get("done", [])) or "- (no work tools used)"
+    blockers = "\n".join("- %s" % redact(f) for f in facts.get("errors", [])) or "- none observed"
+    return (
+        "DONE:\n%s\n\n"
+        "STATE:\n- Automatic checkpoint at %s. This is a deterministic evidence\n"
+        "  trail, not a semantic summary. Nothing here is independently verified.\n\n"
+        "NEXT:\n- Resume from the last DONE entry above.\n\n"
+        "BLOCKERS:\n%s\n" % (done, event_name, blockers)
+    )
+
+
+def main():
+    try:
+        payload = json.load(sys.stdin)
+    except (ValueError, OSError):
+        return 0
+
+    # Implementations differ in how they locate the transcript and the bound
+    # record. Wire those two lookups to your harness; everything above is
+    # harness-independent.
+    #
+    #   facts     = extract(load_events(payload.get("transcript_path")))
+    #   record_id = find_record(payload.get("transcript_path"))
+    #
+    # Only post when a work tool was actually used — see WORK_TOOLS.
+    _ = payload
+    return 0
+
+
+if __name__ == "__main__":
+    # Exit 0 unconditionally, including on an unhandled exception. Breaking the
+    # session to record the session is a bad trade.
+    try:
+        main()
+    except Exception:  # noqa: BLE001 - deliberate catch-all, see harness contract
+        pass
+    sys.exit(0)

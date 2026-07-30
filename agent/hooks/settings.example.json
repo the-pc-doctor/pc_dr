@@ -1,0 +1,51 @@
+{
+  "_comment": [
+    "Harness hook wiring. Key names vary by harness; the SHAPE is the point.",
+    "",
+    "Both hooks exist because the behavior they enforce is otherwise",
+    "model-executed, and model-executed contracts degrade exactly when they",
+    "matter most: under long context, or after a provider chain has failed over",
+    "to a weaker tier. A hook is run by the harness and fires identically",
+    "regardless of which model is behind the endpoint.",
+    "",
+    "NO CREDENTIALS IN THIS FILE. Not in a command line, not in an env block.",
+    "The hook scripts resolve secrets at runtime from the 0600 store. A",
+    "credential here would be copied into every backup of this file and, for a",
+    "prompt-submit hook, into every stored session transcript."
+  ],
+
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$LAB_HOME/agent/hooks/ticket-first.sh"
+          }
+        ]
+      }
+    ],
+
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $LAB_HOME/agent/hooks/auto-checkpoint.py"
+          }
+        ]
+      }
+    ],
+
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $LAB_HOME/agent/hooks/auto-checkpoint.py"
+          }
+        ]
+      }
+    ]
+  }
+}

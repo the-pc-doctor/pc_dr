@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# Prompt-submit hook: enforce stage 1 of the work lifecycle at the harness level.
+#
+# Doctrine: doctrine/operations/work-tracking-lifecycle.md
+# Skill:    agent/skills/work-lifecycle/SKILL.md
+#
+# WHY A HOOK RATHER THAN AN INSTRUCTION. "Search the tracker first" written in a
+# system prompt is model-executed, so it degrades exactly when it matters most:
+# under a long context, or after a provider chain has failed over to a weaker
+# tier. A hook is executed by the harness and fires identically regardless of
+# which model is behind the endpoint.
+#
+# TWO THINGS THIS DELIBERATELY DOES NOT DO:
+#
+#   1. It does not embed a credential in the injected text. Anything injected
+#      into model context is written into every stored session transcript. Point
+#      at a wrapper instead; the wrapper resolves the secret at call time.
+#
+#   2. It does not block on the tracker. A prompt-submit hook is on the critical
+#      path of every single prompt. See the cache below.
+
+set -uo pipefail
+
+source "{{ lab.home_dir }}/agent/lib/credentials.sh"
+
+TRACKER_BASE="$(cred_or_empty ticketing_api_base)"
+TRACKER_USER="$(cred_or_empty ticketing_api_user)"
+TRACKER_PASS="$(cred_or_empty ticketing_api_password)"
+
+RECENT_LIMIT=15
+CACHE_FILE="{{ lab.home_dir }}/.cache/tracker_recent.json"
+CACHE_MAX_AGE=300
+
+emit_context() {
+  jq -nc --arg ctx "$1" '{
+    "hookSpecificOutput": {
+      "hookEventName": "UserPromptSubmit",
+      "additionalContext": $ctx
+    }
+  }'
+}
+
+reminder=$(cat <<'EOF'
+[WORK-TRACKING DIRECTIVE — harness-enforced]
+Your FIRST tool call this turn must be a tracker search or create:
+  (1) agent/lib/worktracker.py find "<subject keywords>"
+  (2) No relevant match: agent/lib/worktracker.py open "<title>" --body "<request verbatim>"
+  (3) Binding to an existing record: post a note saying what you are picking up.
+Do this BEFORE any investigation, edit, or restart.
+
+The helper resolves credentials from the 0600 store. Never write an inline
+`curl -u user:password` — that writes the credential into this transcript.
+
+A search returning nothing is NOT proof of absence. Also scan the snapshot below.
+EOF
+)
+
+# --- Snapshot, served from cache --------------------------------------------
+#
+# Never fetch synchronously here. A tracker that answers in 4 seconds against a
+# 2.5-second hook budget means the fetch NEVER completes, and the snapshot is
+# silently absent on every prompt while appearing to be configured. That failure
+# is invisible: the hook still emits, just without data.
+#
+# Serve the cached copy instantly; refresh detached. A failed refresh leaves the
+# previous cache in place rather than replacing it with nothing.
+
+snapshot=""
+[ -r "${CACHE_FILE}" ] && snapshot="$(cat "${CACHE_FILE}" 2>/dev/null)"
+
+cache_age=$(( $(date +%s) - $(stat -c %Y "${CACHE_FILE}" 2>/dev/null || echo 0) ))
+if [ -n "${TRACKER_PASS}" ] && [ "${cache_age}" -gt "${CACHE_MAX_AGE}" ]; then
+  (
+    mkdir -p "$(dirname "${CACHE_FILE}")" 2>/dev/null
+    tmp="$(mktemp)"
+    if printf 'user = "%s:%s"\n' "${TRACKER_USER}" "${TRACKER_PASS}" | \
+       curl -s --max-time 20 --config - \
+       "${TRACKER_BASE}/tickets?limit=${RECENT_LIMIT}&expand=true&sort_by=updated_at&order_by=DESC" \
+       -o "${tmp}" 2>/dev/null && [ -s "${tmp}" ]; then
+      mv "${tmp}" "${CACHE_FILE}"
+      chmod 600 "${CACHE_FILE}"
+    else
+      rm -f "${tmp}"
+    fi
+  ) >/dev/null 2>&1 &
+  disown 2>/dev/null
+fi
+
+if [ -n "${snapshot}" ]; then
+  lines="$(printf '%s' "${snapshot}" | jq -r '
+    if type=="array" then
+      sort_by(.updated_at) | reverse |
+      .[] | "  - id=\(.id) #\(.number) [\(.state // "?")] \(.title // "(no title)")"
+    else empty end' 2>/dev/null)"
+  if [ -n "${lines}" ]; then
+    emit_context "${reminder}
+
+Recent records (most recently updated first):
+${lines}"
+    exit 0
+  fi
+fi
+
+emit_context "${reminder}
+
+(Snapshot not yet cached — refreshing in the background. Run the search yourself.)"
+
+# ALWAYS exit 0. A non-zero exit from a prompt-submit hook blocks the prompt,
+# which would make a tracker outage into a total work stoppage.
+exit 0
