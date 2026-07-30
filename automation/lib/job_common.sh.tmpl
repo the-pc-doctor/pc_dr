@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Shared contract for unattended scheduled jobs.
+#
+# Doctrine: doctrine/operations/scheduled-maintenance-design.md
+#           doctrine/operations/notification-discipline.md
+#
+# The contract: idempotent, non-interactive, bounded, quiet on success, and
+# heartbeating so that ABSENCE is detectable. A job that only speaks when
+# something is wrong is indistinguishable from a job that has stopped running —
+# the heartbeat is what closes that gap without reintroducing success spam.
+#
+# shellcheck shell=bash
+
+set -uo pipefail
+
+JOB_NAME=""
+JOB_FINDINGS=0
+JOB_LOG_DIR="${JOB_LOG_DIR:-{{ lab.home_dir }}/logs}"
+HEARTBEAT_BASE="http://127.0.0.1:{{ services.uptime_monitor.port }}/api/push"
+
+# Force non-interactive behavior explicitly. Relying on a tool to notice it is
+# not on a terminal is how a job ends up blocked on a prompt at 04:00, holding
+# a lock and producing nothing until someone finds it.
+export DEBIAN_FRONTEND=noninteractive
+export GIT_TERMINAL_PROMPT=0
+export PAGER=cat
+export SYSTEMD_PAGER=cat
+
+job_init() {
+  JOB_NAME="$1"
+  JOB_FINDINGS=0
+  mkdir -p "${JOB_LOG_DIR}" 2>/dev/null || true
+}
+
+job_log() {
+  printf '%s [%s] %s\n' "$(date -Is)" "${JOB_NAME}" "$*" \
+    >>"${JOB_LOG_DIR}/${JOB_NAME}.log"
+}
+
+# Record something that needs a human or a follow-up. Findings are what make a
+# job non-silent; a job with zero findings reports nothing anywhere.
+job_finding() {
+  JOB_FINDINGS=$(( JOB_FINDINGS + 1 ))
+  job_log "FINDING: $*"
+  printf '%s\n' "$*" >>"${JOB_LOG_DIR}/${JOB_NAME}.findings"
+}
+
+# A target that could not be reached is UNKNOWN, not healthy. A maintenance
+# sweep that silently skips an unreachable host every week produces the
+# appearance of coverage with none of the substance.
+job_unreachable() {
+  job_finding "target unreachable, maintenance NOT performed: $1"
+}
+
+# Wake a host and wait for it to actually answer. Sending a magic packet is not
+# the same as the host being up — the readiness check is a probe, not a sleep.
+job_wake_and_wait() {
+  local mac="$1" host="$2" attempts="${3:-30}" i
+  command -v wakeonlan >/dev/null 2>&1 && wakeonlan "${mac}" >/dev/null 2>&1
+  for (( i = 1; i <= attempts; i++ )); do
+    if ping -c1 -W2 "${host}" >/dev/null 2>&1; then
+      job_log "host ${host} is up after ${i} probe(s)"
+      return 0
+    fi
+    sleep 10
+  done
+  job_unreachable "${host}"
+  return 1
+}
+
+# Push the heartbeat. THIS IS THE POINT OF THE WHOLE FILE: the monitor alerts
+# when this does not arrive within the expected window, which is what makes
+# quiet-on-success safe.
+#
+# Always called, including on failure — the heartbeat says "I ran", not
+# "I succeeded". Conflating the two loses the ability to distinguish a failing
+# job from a dead one.
+job_heartbeat() {
+  local status="${1:-up}" token="${JOB_PUSH_TOKEN:-}"
+  [[ -n "${token}" ]] || { job_log "no push token configured; heartbeat skipped"; return 0; }
+  curl -fsS --max-time 15 -o /dev/null \
+    "${HEARTBEAT_BASE}/${token}?status=${status}&msg=${JOB_FINDINGS}+finding(s)" \
+    || job_log "heartbeat push failed — the monitor will report this job as missing"
+}
+
+# Exit path. Quiet on success: no message, no record, nothing.
+job_finish() {
+  local rc="${1:-0}"
+  if [[ ${JOB_FINDINGS} -eq 0 ]]; then
+    job_log "completed with no findings"
+    job_heartbeat up
+  else
+    job_log "completed with ${JOB_FINDINGS} finding(s) — see ${JOB_LOG_DIR}/${JOB_NAME}.findings"
+    job_heartbeat "$([[ ${rc} -eq 0 ]] && echo up || echo down)"
+  fi
+  exit "${rc}"
+}

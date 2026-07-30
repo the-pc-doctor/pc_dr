@@ -1,0 +1,80 @@
+# Edge stack — reverse proxy and authentication gateway.
+#
+# SEPARATE FROM THE CORE STACK ON PURPOSE. This tier is how you get back in.
+# It must survive a restart of everything else, so it is brought up first and
+# taken down last. See reference/services/edge.md and reference/topology.md.
+#
+# Rendered by: python3 scripts/render.py --vars <private>/vars.yml --out <private>/rendered
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Reverse proxy. Single entry point; terminates TLS and routes by name or path.
+  # ---------------------------------------------------------------------------
+  proxy:
+    image: jc21/nginx-proxy-manager:latest
+    container_name: proxy
+    restart: unless-stopped
+    ports:
+      - "{{ services.reverse_proxy.http_port }}:80"
+      - "{{ services.reverse_proxy.https_port }}:443"
+      # Admin interface. Keep this reachable from the LAN WITHOUT traversing the
+      # auth gateway below — otherwise a bad auth rule locks you out of the tool
+      # you need to fix the auth rule.
+      - "{{ services.reverse_proxy.admin_port }}:81"
+    volumes:
+      - {{ lab.home_dir }}/proxy/data:/data
+      - {{ lab.home_dir }}/proxy/letsencrypt:/etc/letsencrypt
+    environment:
+      TZ: {{ lab.timezone }}
+    healthcheck:
+      # Checks that the proxy answers, not that any backend is healthy. Those
+      # are different questions and conflating them is the tier-4-reported-as-
+      # tier-5 misdiagnosis.
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:81"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ---------------------------------------------------------------------------
+  # Authentication gateway. Sits in front of administrative and sensitive
+  # surfaces via the proxy's forward-auth mechanism.
+  #
+  # Decide deliberately what is NOT gated: services with their own auth, mobile
+  # clients that cannot complete an interactive flow, and webhook endpoints an
+  # external system must be able to call. Record every exemption and why — an
+  # undocumented one looks like a misconfiguration to the next reader, who will
+  # "fix" it and break a client.
+  # ---------------------------------------------------------------------------
+  auth:
+    image: authelia/authelia:latest
+    container_name: auth
+    restart: unless-stopped
+    ports:
+      - "{{ services.auth_gateway.port }}:9091"
+    volumes:
+      - {{ lab.home_dir }}/auth/config:/config
+    environment:
+      TZ: {{ lab.timezone }}
+    healthcheck:
+      test: ["CMD", "sh", "-c", "wget -q -O- http://127.0.0.1:9091/api/health || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+# Operational notes:
+#
+#   * Certificate renewal fails quietly and breaks everything external at once,
+#     on the expiry date rather than the failure date. Monitor DAYS TO EXPIRY as
+#     a metric; do not monitor renewal success as an event.
+#
+#   * Where the proxy generates its configuration from a database, hand edits to
+#     the generated files are lost on regeneration. If one is genuinely
+#     required, document that it exists and expect to reapply it. Some builds
+#     need more than one reload before a change takes effect — verify the served
+#     behavior, never the reload's exit code.
+#
+#   * Test any auth change from a SECOND browser session before closing the one
+#     that still works.

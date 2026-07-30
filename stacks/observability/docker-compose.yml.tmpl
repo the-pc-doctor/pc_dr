@@ -1,0 +1,77 @@
+# Observability stack — uptime monitoring and dashboard.
+#
+# SEPARATE STACK ON PURPOSE. A monitor that shares a failure domain with what it
+# monitors reports nothing at the moment you need it. On a single host this
+# cannot be fully solved, but keeping it out of the core stack means a core
+# restart does not take the monitoring with it.
+#
+# Pair this with ONE external check of "is the lab reachable at all" — no
+# on-host monitor can answer that question about its own host.
+#
+# See reference/services/observability.md.
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Uptime monitoring.
+  #
+  # Probe BACKENDS DIRECTLY, not through the reverse proxy. A check that goes
+  # via the proxy tests the proxy, DNS, the certificate, and the service all at
+  # once, and cannot tell you which failed — so the proxy going down reports as
+  # every service going down.
+  #
+  # The feature that matters most here is the PUSH monitor: a scheduled job
+  # reports in on completion and this alerts when the report does not arrive.
+  # That is what makes "quiet on success" safe — without it, a job that never
+  # ran is indistinguishable from a job with nothing to do.
+  # ---------------------------------------------------------------------------
+  uptime:
+    image: louislam/uptime-kuma:1
+    container_name: uptime
+    restart: unless-stopped
+    ports:
+      - "{{ services.uptime_monitor.port }}:3001"
+    volumes:
+      - {{ lab.home_dir }}/uptime/data:/app/data
+    environment:
+      TZ: {{ lab.timezone }}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:3001"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ---------------------------------------------------------------------------
+  # Dashboard — the single view a human actually looks at.
+  #
+  # Its value is inversely proportional to how much it shows. Sixty tiles is a
+  # wall, not a signal.
+  #
+  # Host-level statistics require explicit host mounts (below) and REMOTE hosts
+  # require an agent on each. Neither works by default, and both fail by simply
+  # showing nothing — which looks identical to nothing being wrong. Verify the
+  # dashboard displays real data at least once after any change to it.
+  # ---------------------------------------------------------------------------
+  dashboard:
+    image: glanceapp/glance:latest
+    container_name: dashboard
+    restart: unless-stopped
+    ports:
+      - "{{ services.dashboard.port }}:8080"
+    volumes:
+      - {{ lab.home_dir }}/dashboard/config:/app/config
+      # Required for host statistics. Without these the widget renders empty.
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /etc/os-release:/host/etc/os-release:ro
+    environment:
+      TZ: {{ lab.timezone }}
+
+# Deliberately not here:
+#
+#   * The metrics database. It belongs with whatever writes to it most heavily,
+#     and it has a different retention and disk-pressure profile. Set a
+#     retention window at deployment — unbounded series on a small disk is a
+#     scheduled outage, and the outage it causes is the one this stack existed
+#     to warn about.

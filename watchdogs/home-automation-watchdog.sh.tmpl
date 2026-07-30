@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# Home automation watchdog.
+#
+# Doctrine: doctrine/reliability/watchdog-blast-radius.md
+# Reference: reference/services/home-automation.md
+#
+# Two things a liveness check gets wrong here:
+#
+#   1. The API answers while half the integrations are dead. "Up" and "working"
+#      are different questions, and only the second one matters to the people
+#      using the house.
+#
+#   2. The remediation for one integration losing its connection is to reload
+#      THAT integration, not to restart the platform. Restarting the platform
+#      because one cloud integration is unreachable takes down every automation
+#      in the house to fix one of them.
+
+set -uo pipefail
+source "{{ lab.home_dir }}/watchdogs/lib/watchdog_common.sh"
+
+wd_init home_automation
+
+HA_UNIT="homeassistant"
+HA_API="http://127.0.0.1:{{ services.home_automation.port }}"
+TOKEN_REF="home_automation_token"
+
+# Fraction of entities unavailable that indicates a real problem rather than a
+# few offline devices. Some entities are always unavailable in any real house.
+UNAVAILABLE_THRESHOLD=50
+
+# This is a named critical service. Whole-platform restarts stay off; when this
+# cap is reached, the SIGNAL in the log is the intended output.
+export WD_TIER3_MAX_PER_HOUR=0
+
+token="$(awk -F= -v k="${TOKEN_REF}" '$1 ~ k {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2}' \
+  "{{ credentials.file }}" 2>/dev/null | head -1)"
+
+# --- Restart-loop guard, before anything else -------------------------------
+#
+# A bad configuration or a failing integration causes repeated startup failure.
+# A watchdog that reacts to "not responding" by restarting will happily add
+# restarts to a service that is already restart-looping, and the loop then looks
+# like the watchdog working.
+
+restarts="$(_wd_recent_count 1)"
+if [[ "${restarts}" -ge 3 ]]; then
+  wd_log "SIGNAL: ${restarts} restarts in the last hour — this is a restart LOOP, not a transient fault"
+  wd_log "stopping. Check the configuration and the startup log; adding restarts will not help"
+  exit 1
+fi
+
+# --- Liveness ---------------------------------------------------------------
+
+if ! wd_container_running "${HA_UNIT}"; then
+  wd_log "container is not running"
+  wd_remediate "${HA_UNIT}" 1 "container not running" && wd_verify "${HA_API}/manifest.json"
+  exit $?
+fi
+
+if ! wd_probe_http "${HA_API}/manifest.json"; then
+  wd_log "API not responding"
+  # Cold start is slow. Verify with a generous window rather than declaring
+  # failure and restarting again into a service that was already coming up.
+  wd_remediate "${HA_UNIT}" 1 "api unresponsive" && wd_verify "${HA_API}/manifest.json" 12 15
+  exit $?
+fi
+
+# --- The signal that matters ------------------------------------------------
+
+if [[ -z "${token}" ]]; then
+  wd_log "no API token available — liveness verified, entity health NOT checked"
+  exit 0
+fi
+
+states="$(curl -fsS --max-time 20 -H "Authorization: Bearer ${token}" \
+  "${HA_API}/api/states" 2>/dev/null)" || {
+  wd_log "API responds unauthenticated but the states endpoint failed — partial failure"
+  exit 1
+}
+
+read -r total unavailable domains <<<"$(printf '%s' "${states}" | python3 -c '
+import json, sys
+from collections import Counter
+try:
+    entities = json.load(sys.stdin)
+except Exception:
+    print("0 0 -"); sys.exit(0)
+bad = [e for e in entities
+       if e.get("state") in ("unavailable", "unknown")]
+# Which integration domains the dead entities belong to. A single domain
+# dominating means ONE integration lost its connection - reload that, do not
+# restart the platform.
+counts = Counter(e["entity_id"].split(".")[0] for e in bad)
+top = ",".join("%s=%d" % kv for kv in counts.most_common(3)) or "-"
+print(len(entities), len(bad), top)
+')"
+
+[[ "${total}" -gt 0 ]] || { wd_log "no entities returned — treat as unknown, not healthy"; exit 1; }
+
+percent=$(( unavailable * 100 / total ))
+if [[ ${percent} -lt ${UNAVAILABLE_THRESHOLD} ]]; then
+  exit 0
+fi
+
+wd_log "${unavailable}/${total} entities unavailable (${percent}%) — concentrated in: ${domains}"
+
+# Bounded remediation: reload the affected integration, not the platform.
+#
+# The domain breakdown is what makes this possible. Without it the only
+# available action is the platform-wide restart that takes every working
+# automation down to fix one integration.
+wd_log "reload the dominant integration above before considering anything wider"
+wd_log "SIGNAL: entity availability degraded — recorded without a platform restart"
+_wd_record 1
+
+exit 1

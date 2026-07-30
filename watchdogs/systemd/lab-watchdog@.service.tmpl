@@ -1,0 +1,37 @@
+[Unit]
+# Templated watchdog unit. The instance name selects the script:
+#   systemctl enable --now lab-watchdog@nvr.timer
+# runs {{ lab.home_dir }}/watchdogs/nvr-watchdog.sh
+Description=Lab watchdog (%i)
+Documentation=file://{{ lab.home_dir }}/watchdogs/README.md
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User={{ lab.operator_user }}
+
+Environment=WD_STATE_DIR=/var/lib/lab-watchdog
+Environment=LAB_HOME={{ lab.home_dir }}
+# Named critical services. A watchdog refuses to take one of these down outside
+# a maintenance window. Space-separated; asked of the operator, never inferred.
+Environment=WD_CRITICAL_SERVICES=home_automation nvr
+
+ExecStart={{ lab.home_dir }}/watchdogs/%i-watchdog.sh
+
+# A watchdog that hangs holds no lock and heals nothing, but it does hide the
+# fault. Bound it.
+TimeoutStartSec=300
+
+# The watchdog must not be a memory-pressure casualty, and must not be the
+# reason something else is one.
+Nice=10
+IOSchedulingClass=idle
+MemoryMax=128M
+
+# Do not restart the watchdog on failure. A failing watchdog is a finding, and
+# a restart loop here would hammer whatever it is trying to heal.
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,63 @@
+# Agent stack — the model-provider gateway the agent runtime talks to.
+#
+# One aggregating gateway in front of every upstream. The agent has ONE base URL
+# and one model name; tier health, priority, and retry are the gateway's
+# problem — not conditional retry logic inside an agent that is, by definition,
+# degraded at the moment it would need to run.
+#
+# See doctrine/capabilities/model-provider-failover.md and
+# agent/config/agent-runtime.yaml.tmpl.
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # OpenAI-compatible multiplexer.
+  # https://github.com/router-for-me/CLIProxyAPI
+  #
+  # Register several upstream credentials, give each a priority, and it serves
+  # whichever tier is healthy.
+  #
+  # THREE THINGS THAT ARE EASY TO GET WRONG:
+  #
+  #   1. Tiers only fail over to each other if they expose the SAME model
+  #      identifiers. A fallback advertising different names is not a fallback —
+  #      requests for the primary's model simply fail while the second tier sits
+  #      there healthy and unconsulted. Verify by asking each tier what it
+  #      serves and comparing the lists, not by reading the config.
+  #
+  #   2. Configuration is read at START. Edit, then restart, or you are testing
+  #      the old chain and drawing conclusions from it.
+  #
+  #   3. This gateway is now a single point of failure for every tier behind it.
+  #      Keep it trivially restartable, monitor it independently of the agent,
+  #      and keep at least one tier that does not require the internet.
+  # ---------------------------------------------------------------------------
+  gateway:
+    image: eceasy/cli-proxy-api:latest
+    container_name: gateway
+    restart: unless-stopped
+    ports:
+      - "{{ services.agent_gateway.port }}:8317"
+    volumes:
+      - {{ lab.home_dir }}/gateway/config:/config
+    environment:
+      TZ: {{ lab.timezone }}
+    healthcheck:
+      # Asks the gateway what models it currently serves. This is a real health
+      # signal: an empty or failing model list means every tier is down, which a
+      # plain port check would report as healthy.
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8317/v1/models"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+# Operational notes:
+#
+#   * Usage accounting generally needs a collector on a schedule plus a
+#     retention setting. Where the usage queue is a DESTRUCTIVE read, two
+#     collectors will silently split the data between them — run exactly one.
+#
+#   * Credentials belong in the mounted config, sourced from the mode-0600
+#     credential file. Never in this compose file, never in the environment
+#     block, never in a committed template.

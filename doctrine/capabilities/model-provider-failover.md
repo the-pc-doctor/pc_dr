@@ -47,7 +47,7 @@ An agent that manages infrastructure needs to keep working when a model provider
 
 Failover logic inside the agent runs precisely when the agent is degraded — mid-request, out of quota, possibly on a weaker model. That is the worst available moment to execute conditional retry logic, and the code path is the least exercised in the system.
 
-An aggregating gateway that speaks a single OpenAI-compatible interface solves this structurally. The agent has one base URL and one model name; tier health, priority, and retry are the gateway's problem. CLIProxyAPI (published as the `eceasy/cli-proxy-api` image) is one such multiplexer: register several upstream credentials, give each a priority, and it serves whichever tier is healthy.
+An aggregating gateway that speaks a single OpenAI-compatible interface solves this structurally. The agent has one base URL and one model name; tier health, priority, and retry are the gateway's problem. [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) (published as the `eceasy/cli-proxy-api` image) is one such multiplexer: register several upstream credentials, give each a priority, and it serves whichever tier is healthy.
 
 The cost is honest and worth naming: **the gateway becomes a single point of failure.** Keep it trivially restartable, monitor it independently of the agent, and make sure a local or on-host tier exists so the agent is not entirely dependent on the internet — which is exactly when you tend to need it.
 

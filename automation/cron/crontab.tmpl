@@ -1,0 +1,64 @@
+# Scheduled maintenance.
+#
+# Doctrine: doctrine/operations/scheduled-maintenance-design.md
+#
+# Rules encoded in the layout below:
+#
+#   * NOTHING STARTS AT :00. Jobs that all fire on the hour contend for CPU,
+#     memory, disk, and network at the same moment — on a small board that is
+#     enough to trigger a memory event and get something important killed.
+#
+#   * QUIET ON SUCCESS. A job with nothing to report produces nothing. Every job
+#     here therefore pushes a heartbeat on completion, and the uptime monitor
+#     alerts on the heartbeat NOT ARRIVING. Without that, a job that never runs
+#     is indistinguishable from a job with nothing to do.
+#
+#   * BOUNDED. `timeout` on everything. An unbounded scheduled job is how one
+#     hung request becomes a permanently held lock.
+#
+#   * NON-OVERLAPPING. `flock -n` so a slow run is skipped rather than doubled.
+#     The lock is on a file, so a crashed run does not block every future one.
+#
+#   * NEVER SILENTLY SKIP. A job whose target is unreachable must record that.
+#     Unreachable is unknown, and unknown must be visible — it is not healthy.
+
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+LAB_HOME={{ lab.home_dir }}
+
+# --- Self-healing ------------------------------------------------------------
+# Watchdogs run as systemd timers, not cron. See watchdogs/systemd/.
+# Timers give per-instance cadence, boot delay, and randomized spread, none of
+# which cron does well.
+
+# --- Freshness and reconciliation -------------------------------------------
+# Hourly. Compares intended state against observed state and corrects the
+# difference. This is what catches an edge-triggered automation whose trigger
+# was missed — without it, nothing ever retries and the system sits in a state
+# nobody intended.
+7 * * * * flock -n /tmp/lab-reconcile.lock timeout 300 ${LAB_HOME}/automation/reconcile.sh
+
+# --- Daily ------------------------------------------------------------------
+# Log rotation and cache trimming. Cheap, and prevents the slow disk-fill that
+# eventually presents as an unrelated service failing.
+23 4 * * * flock -n /tmp/lab-trim.lock timeout 600 ${LAB_HOME}/automation/trim.sh
+
+# --- Weekly -----------------------------------------------------------------
+# Backup. Deliberately NOT adjacent to the image refresh below — both are
+# I/O-heavy and one of them would be starved.
+{{ backup.schedule }} flock -n /tmp/lab-backup.lock timeout 7200 ${LAB_HOME}/automation/backup.sh
+
+# Per-service health pass. Files one record per service that needs work, and
+# NOTHING when everything is fine.
+{{ maintenance.service_schedule }} flock -n /tmp/lab-health.lock timeout 1800 ${LAB_HOME}/automation/health-pass.sh
+
+# --- Monthly ----------------------------------------------------------------
+# Host packages, container image refresh, image and volume pruning.
+# Long, disruptive, and the most likely to need a rollback — so it runs when
+# nobody is using the house, and it backs up first.
+{{ maintenance.host_schedule }} flock -n /tmp/lab-maint.lock timeout 10800 ${LAB_HOME}/automation/host-maintenance.sh
+
+# Restore verification. An unverified backup is a belief, not a backup — this
+# restores to a scratch location and checks the result. If you only adopt one
+# line from this file, adopt this one.
+41 5 1 * * flock -n /tmp/lab-restore.lock timeout 3600 ${LAB_HOME}/automation/verify-restore.sh

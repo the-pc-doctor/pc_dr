@@ -1,0 +1,29 @@
+[Unit]
+Description=Lab watchdog schedule (%i)
+
+[Timer]
+# Wait for the host to settle before the first check. A watchdog that fires
+# during boot will find services legitimately not up yet and "heal" them,
+# turning a normal startup into a restart storm.
+OnBootSec=5min
+
+# Default cadence. Override per instance with a drop-in rather than editing
+# this template:
+#   systemctl edit lab-watchdog@nvr.timer
+#   [Timer]
+#   OnUnitActiveSec=2min
+OnUnitActiveSec=5min
+
+# Spread instances so several watchdogs do not probe, and potentially remediate,
+# at the same moment on a small host.
+RandomizedDelaySec=60
+
+# Do not fire a missed run immediately after a boot or a suspend. Catching up on
+# skipped checks means several remediations at once, which is the opposite of
+# what a settling host needs.
+Persistent=false
+
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

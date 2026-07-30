@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# Edge watchdog — proxy and auth gateway.
+#
+# Doctrine: doctrine/reliability/watchdog-blast-radius.md
+# Reference: reference/services/edge.md, reference/topology.md
+#
+# Exists to resolve the single most common misdiagnosis in this architecture:
+# a service is healthy on the host and unreachable through its name, and the
+# report arrives as "the service is down." Restarting the healthy service costs
+# an outage and fixes nothing.
+#
+# Also handles the failure a plain restart cannot: the proxy container being
+# GONE rather than broken, after an update, a prune, or a failed recreate.
+# `docker restart` on something that does not exist fails silently.
+
+set -uo pipefail
+source "{{ lab.home_dir }}/watchdogs/lib/watchdog_common.sh"
+
+wd_init edge
+
+PROXY_UNIT="proxy"
+PROXY_ADMIN="http://127.0.0.1:{{ services.reverse_proxy.admin_port }}"
+COMPOSE_DIR="{{ lab.home_dir }}/stacks/edge"
+
+# A representative backend, checked BOTH ways. Direct tells you the service is
+# fine; proxied tells you the path is fine. The pair localizes the fault.
+BACKEND_DIRECT="http://127.0.0.1:{{ services.home_automation.port }}/manifest.json"
+BACKEND_PROXIED="https://{{ network.external_domain }}/manifest.json"
+
+# --- Is the container even there? -------------------------------------------
+
+if ! wd_container_running "${PROXY_UNIT}"; then
+  wd_log "proxy container is not running"
+  wd_capture_evidence "${PROXY_UNIT}" "container missing or stopped"
+
+  # Recreate rather than restart. If the container was removed, restart is a
+  # no-op that reports failure and heals nothing.
+  if wd_tier_allowed 2; then
+    wd_log "tier 2 remediation: recreating the edge stack"
+    _wd_record 2
+    (cd "${COMPOSE_DIR}" && docker compose up -d) >/dev/null 2>&1
+    wd_verify "${PROXY_ADMIN}" 6 10
+    exit $?
+  fi
+  exit 1
+fi
+
+# --- Does the proxy itself answer? ------------------------------------------
+
+if ! wd_probe_http "${PROXY_ADMIN}"; then
+  wd_log "proxy is running but its admin interface does not answer"
+  wd_remediate "${PROXY_UNIT}" 1 "proxy unresponsive" && wd_verify "${PROXY_ADMIN}"
+  exit $?
+fi
+
+# --- Localize: path fault or service fault? ---------------------------------
+
+wd_probe_both_paths "${BACKEND_DIRECT}" "${BACKEND_PROXIED}"
+case $? in
+  0)
+    # Both paths fine.
+    ;;
+  2)
+    # Healthy directly, unreachable proxied. The fault is the path.
+    #
+    # Note what is NOT happening here: the backend is not being touched. It is
+    # working. Remediation stays inside the tier that actually failed.
+    wd_log "path fault confirmed — backend healthy, proxied route failing"
+    wd_remediate "${PROXY_UNIT}" 1 "routing failure with healthy backend" \
+      && wd_verify "${BACKEND_PROXIED}"
+    exit $?
+    ;;
+  *)
+    # The backend is failing directly. Not this watchdog's component — say so
+    # and stop. A watchdog that remediates outside its scope is the blast-radius
+    # failure in a different costume.
+    wd_log "backend failing on the DIRECT path — not an edge fault; deferring to its own watchdog"
+    exit 0
+    ;;
+esac
+
+# --- Certificate runway -----------------------------------------------------
+#
+# Renewal fails quietly and breaks everything external at once, on the EXPIRY
+# date rather than the failure date. Monitor days remaining as a metric; do not
+# monitor renewal success as an event.
+
+expiry="$(echo | openssl s_client -servername "{{ network.external_domain }}" \
+  -connect "{{ network.external_domain }}:{{ services.reverse_proxy.https_port }}" 2>/dev/null \
+  | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)"
+
+if [[ -n "${expiry}" ]]; then
+  days=$(( ( $(date -d "${expiry}" +%s) - $(date +%s) ) / 86400 ))
+  if [[ ${days} -lt 21 ]]; then
+    wd_log "SIGNAL: certificate expires in ${days} day(s) — renewal is not keeping up"
+  fi
+else
+  wd_log "SIGNAL: could not read certificate expiry — treat as unknown, not as fine"
+fi
+
+exit 0

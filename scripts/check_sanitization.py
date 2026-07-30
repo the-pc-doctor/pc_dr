@@ -52,8 +52,17 @@ ALLOWED_LITERALS = {
 }
 ALLOWED_HOME_USERS = {"operator", "user", "agent", "youruser", "someuser", "$USER"}
 PLACEHOLDER_VALUE = re.compile(
-    r"^\s*(?:\{\{.*\}\}|\$\{?\w+\}?|<[^>]+>|CHANGEME|REPLACE\w*|example\S*|placeholder\S*|"
-    r"your[-_]\S*|\S*_ref|null|~|\"\"|''|)\s*$",
+    r"^\s*(?:\{\{.*\}\}|\$\{?[\w:?+\-]*\}?|<[^>]+>|CHANGEME|REPLACE\w*|example\S*|"
+    r"placeholder\S*|your[-_]\S*|\S*_ref|null|~|)\s*$",
+    re.I,
+)
+
+# systemd template units (`unit@instance.timer`) and similar constructs match  # sanitize:allow pattern-definition
+# the email pattern. The distinguishing feature is that the right-hand side
+# ends in a file or unit extension rather than a top-level domain.
+NOT_A_DOMAIN = re.compile(
+    r"\.(?:timer|service|socket|target|mount|path|slice|device|swap|automount|"
+    r"yaml|yml|sh|py|md|json|conf|cfg|ini|tmpl|log|txt|example|local|internal)$",
     re.I,
 )
 
@@ -170,7 +179,7 @@ def scan_text(where, text, denylist, findings):
             key, value = match.group("key"), match.group("value")
             if key.lower().endswith(("_ref", "-ref")):
                 continue
-            if PLACEHOLDER_VALUE.match(value):
+            if PLACEHOLDER_VALUE.match(value.strip("\"'")):
                 continue
             if value.strip("\"'").lower() in ("true", "false", "none", "required", "optional"):
                 continue
@@ -191,8 +200,10 @@ def scan_text(where, text, denylist, findings):
                 findings.append(Finding(where, line_no, "real home path", match.group(0)))
 
         for match in EMAIL.finditer(line):
-            if match.group(1).lower() not in ALLOWED_DOMAINS:
-                findings.append(Finding(where, line_no, "email address", match.group(0)))
+            domain = match.group(1)
+            if domain.lower() in ALLOWED_DOMAINS or NOT_A_DOMAIN.search(domain):
+                continue
+            findings.append(Finding(where, line_no, "email address", match.group(0)))
 
         for match in LONG_HEX.finditer(line):
             findings.append(Finding(where, line_no, "long hex run", match.group(0)))

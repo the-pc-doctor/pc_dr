@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# NVR watchdog — the canonical bounded-remediation example.
+#
+# Doctrine: doctrine/reliability/watchdog-blast-radius.md
+# Reference: reference/services/nvr.md
+#
+# The failure this is built to avoid: one intermittently flaky camera trips a
+# health check whose remediation restarts the whole service, gapping recordings
+# on every OTHER camera and clearing the evidence that would have identified the
+# culprit. The service then reports a high heal rate and a high success rate
+# while steadily losing availability.
+#
+# So: detect per camera, remediate per camera, and keep whole-service restarts
+# capped at zero unless there is evidence the fault's true scope is the service.
+
+set -uo pipefail
+source "{{ lab.home_dir }}/watchdogs/lib/watchdog_common.sh"
+
+wd_init nvr
+
+NVR_UNIT="nvr"
+NVR_LOCAL="http://127.0.0.1:{{ services.nvr.port }}/api/version"
+NVR_STATS="http://127.0.0.1:{{ services.nvr.port }}/api/stats"
+RECORDINGS="{{ hosts.storage.nfs_exports.recordings }}"
+
+# Whole-service restarts OFF. Raise this only with evidence, and expect the
+# cap-reached SIGNAL in the log to be the thing that tells you to.
+export WD_TIER3_MAX_PER_HOUR=0
+
+# --- Check the shared dependency first --------------------------------------
+#
+# A stale or dropped network mount presents as "recording stopped" with a
+# perfectly healthy container. Restarting the service does not fix a mount, and
+# checking the service first wastes the outage.
+
+if ! mountpoint -q "${RECORDINGS}" 2>/dev/null; then
+  wd_log "STORAGE: ${RECORDINGS} is not mounted — this is the fault, not the service"
+  wd_log "remediating the service would accomplish nothing; not restarting"
+  exit 1
+fi
+
+if ! touch "${RECORDINGS}/.wd-write-probe" 2>/dev/null; then
+  wd_log "STORAGE: ${RECORDINGS} is mounted but not writable — stale handle likely"
+  exit 1
+fi
+rm -f "${RECORDINGS}/.wd-write-probe" 2>/dev/null
+
+# --- Liveness ---------------------------------------------------------------
+
+if ! wd_container_running "${NVR_UNIT}"; then
+  wd_log "container is not running"
+  wd_remediate "${NVR_UNIT}" 3 "container not running" && wd_verify "${NVR_LOCAL}"
+  exit $?
+fi
+
+if ! wd_probe_http "${NVR_LOCAL}"; then
+  wd_log "API not responding"
+  wd_remediate "${NVR_UNIT}" 3 "api unresponsive" && wd_verify "${NVR_LOCAL}"
+  exit $?
+fi
+
+# --- The signal a liveness check misses -------------------------------------
+#
+# Detection at zero on a RUNNING process is the characteristic backend wedge.
+# The port answers, the container is healthy, and nothing is being processed.
+
+stats="$(curl -fsS --max-time 10 "${NVR_STATS}" 2>/dev/null)" || {
+  wd_log "stats endpoint unavailable while version endpoint responds — partial failure"
+  exit 1
+}
+
+# Per-camera detection rate. This is what makes bounded remediation possible:
+# without knowing WHICH camera is dead, the only available action is the
+# service-wide restart this watchdog exists to avoid.
+stalled="$(printf '%s' "${stats}" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+cameras = data.get("cameras", data)
+for name, values in cameras.items():
+    if not isinstance(values, dict):
+        continue
+    if "camera_fps" not in values:
+        continue
+    if float(values.get("camera_fps") or 0) <= 0:
+        print(name)
+' 2>/dev/null)"
+
+if [[ -z "${stalled}" ]]; then
+  exit 0
+fi
+
+# --- Bounded remediation ----------------------------------------------------
+
+for camera in ${stalled}; do
+  wd_log "camera ${camera} is at zero frames per second"
+  # Restart the CAMERA, not the service. Where the platform exposes a
+  # per-camera control, use it. This is tier 1: detection identified the
+  # component, so remediation acts on that component.
+  if curl -fsS --max-time 10 -X POST \
+      "http://127.0.0.1:{{ services.nvr.port }}/api/${camera}/restart" >/dev/null 2>&1; then
+    wd_log "tier 1 remediation: restarted camera ${camera}"
+    _wd_record 1
+  else
+    # No per-camera control available. Record the observation and let the
+    # per-camera event count accumulate — a distribution concentrated on one
+    # camera names the culprit, which is worth more than a restart.
+    wd_log "no per-camera restart available for ${camera}; recording observation only"
+    wd_log "SIGNAL: repeated entries for one camera identify a hardware or "\
+"stream fault that a service restart would only mask"
+    _wd_record 1
+  fi
+done
+
+exit 0

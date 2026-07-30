@@ -1,0 +1,163 @@
+# Home-automation patterns.
+#
+# Reference: reference/services/home-automation.md
+#
+# TWO NON-NEGOTIABLE CONSTRAINTS, both about staying editable in the platform UI:
+#
+#   1. EVERY automation carries a stable unique `id`. Without one the UI cannot
+#      address it for editing. Use a millisecond epoch or a stable slug.
+#
+#   2. ALL automations live in the SINGLE file the main configuration includes.
+#      A split-directory merge include breaks the UI edit path, and the breakage
+#      is silent — the automations still run, they just stop being editable.
+#
+# Prefer writing through the platform's configuration API, which assigns and
+# preserves ids for you. When editing this file directly: back it up first,
+# reload, then confirm the API can address the new entry. If it cannot, the
+# entry went somewhere the UI will not find.
+#
+# These are shape examples. Entity ids are placeholders.
+
+# -----------------------------------------------------------------------------
+# PATTERN 1 — Closed-loop actuation.
+#
+# An accepted command is not an achieved effect. This pattern confirms the
+# result through a channel independent of the one that issued the command, and
+# bounds its retries.
+#
+# doctrine/reliability/verification-before-claiming-done.md
+# -----------------------------------------------------------------------------
+- id: pattern-closed-loop-actuation
+  alias: "Pattern: close the door, then confirm it closed"
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.example_departure
+      to: "off"
+  condition:
+    # Confirm the desired state is not ALREADY true. Commanding something into
+    # a state it already holds produces a success that proves nothing.
+    - condition: state
+      entity_id: cover.example_door
+      state: open
+  action:
+    - service: cover.close_cover
+      target:
+        entity_id: cover.example_door
+
+    # Independent confirmation, bounded. Not the service call's return value —
+    # a different sensor on the same physical fact.
+    - wait_for_trigger:
+        - platform: state
+          entity_id: binary_sensor.example_door_contact
+          to: "off"
+      timeout: "00:01:30"
+      continue_on_timeout: true
+
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: binary_sensor.example_door_contact
+              state: "on"
+          sequence:
+            # NOT verified. Say so, once, to a human — this is a real decision
+            # they can act on, which is what earns a notification.
+            - service: notify.operator_direct
+              data:
+                message: >-
+                  Close command sent but the contact sensor still reads open
+                  after 90s. Not retrying — a loop against a physical
+                  obstruction is a hazard, not persistence.
+
+# -----------------------------------------------------------------------------
+# PATTERN 2 — Reconciliation.
+#
+# Edge-triggered automation fails silently the first time the edge is missed:
+# the trigger fires once, the command is lost, nothing retries, and the system
+# sits in a state nobody intended.
+#
+# Pair every consequential edge trigger with a periodic reconciliation that
+# compares intended state against observed state — and let a human override win.
+# -----------------------------------------------------------------------------
+- id: pattern-reconcile-intended-state
+  alias: "Pattern: reconcile intended vs observed state"
+  mode: single
+  trigger:
+    - platform: time_pattern
+      minutes: "/15"
+  condition:
+    # Intended state says closed...
+    - condition: state
+      entity_id: input_boolean.example_should_be_closed
+      state: "on"
+    # ...observed state says open.
+    - condition: state
+      entity_id: binary_sensor.example_door_contact
+      state: "on"
+      for: "00:05:00"
+    # RESPECT MANUAL OVERRIDE. A human who deliberately opened it must be able
+    # to win. Reconciliation that fights the operator is worse than none,
+    # because it is unpredictable.
+    - condition: state
+      entity_id: input_boolean.example_manual_override
+      state: "off"
+  action:
+    - service: cover.close_cover
+      target:
+        entity_id: cover.example_door
+
+# -----------------------------------------------------------------------------
+# PATTERN 3 — Guard against a stale entity.
+#
+# An entity that stops updating reports its last known value indefinitely, and
+# will confirm whatever you hoped. Check that the reading is NEW, not merely
+# correct: a value without a fresh timestamp is a memory, not a state.
+#
+# doctrine/knowledge/source-authority.md
+# -----------------------------------------------------------------------------
+- id: pattern-freshness-guard
+  alias: "Pattern: refuse to act on a stale reading"
+  mode: single
+  trigger:
+    - platform: numeric_state
+      entity_id: sensor.example_measurement
+      above: 30
+  condition:
+    # The entity has actually reported within the last 15 minutes. Without this,
+    # a frozen sensor holds the automation permanently triggered or permanently
+    # silent, and neither failure is visible.
+    - condition: template
+      value_template: >-
+        {{ (now() - states.sensor.example_measurement.last_updated).total_seconds() < 900 }}
+  action:
+    - service: switch.turn_on
+      target:
+        entity_id: switch.example_mitigation
+
+# -----------------------------------------------------------------------------
+# PATTERN 4 — Empty-group guard.
+#
+# A group, list, or collection that resolves to no members accepts every command
+# and does nothing, reporting success each time. The classic instance is a
+# notification or media group that was renamed and left an empty orphan behind:
+# every announcement "succeeds" and nobody hears anything.
+#
+# Verify MEMBERSHIP, not existence.
+# -----------------------------------------------------------------------------
+- id: pattern-empty-group-guard
+  alias: "Pattern: verify group membership before announcing"
+  mode: single
+  trigger:
+    - platform: event
+      event_type: example_announcement_requested
+  condition:
+    - condition: template
+      value_template: >-
+        {{ state_attr('media_player.example_group', 'entity_id') | default([], true) | count > 0 }}
+  action:
+    - service: tts.speak
+      target:
+        entity_id: media_player.example_group
+      data:
+        message: "{{ trigger.event.data.message }}"
