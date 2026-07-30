@@ -65,6 +65,7 @@ Common shapes:
 - **Summary versus detail.** A rolled-up status says idle while the underlying telemetry shows activity. Trust the detail; the summary is derived and can lag or fail independently.
 - **An empty aggregate.** A group, list, or collection that resolves to nothing accepts every command and does nothing, reporting success each time. Verify membership, not just existence.
 - **Cache in front of truth.** A dashboard, proxy, or API layer serving a value the origin no longer holds.
+- **A parameter accepted but ignored.** An API can take `sort`, `filter`, or `limit`, return a well-formed response, and have applied none of them. The result looks right — correct shape, correct row count — and is wrong in exactly the way you were relying on it not to be. Verify a parameter took effect by checking the data, not by confirming the request succeeded.
 
 The defense is cheap: **check freshness alongside value.** A reading without a timestamp is not a state, it is a memory. When a value looks right but the timestamp has not advanced, you have found the fault, not the answer.
 

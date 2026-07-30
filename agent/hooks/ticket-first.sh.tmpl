@@ -73,9 +73,15 @@ if [ -n "${TRACKER_PASS}" ] && [ "${cache_age}" -gt "${CACHE_MAX_AGE}" ]; then
   (
     mkdir -p "$(dirname "${CACHE_FILE}")" 2>/dev/null
     tmp="$(mktemp)"
+    # NOTE THE ENDPOINT. The plain list endpoint silently IGNORES sort_by and
+    # returns lowest-id-first, so a "recent records" snapshot built on it lists
+    # the OLDEST records — while looking entirely correct, because the row count
+    # is right. Verify that a sort parameter is honored rather than assuming a
+    # documented parameter takes effect. The search endpoint honors it and, with
+    # expand=true, returns the same array-of-expanded-records shape.
     if printf 'user = "%s:%s"\n' "${TRACKER_USER}" "${TRACKER_PASS}" | \
        curl -s --max-time 20 --config - \
-       "${TRACKER_BASE}/tickets?limit=${RECENT_LIMIT}&expand=true&sort_by=updated_at&order_by=DESC" \
+       "${TRACKER_BASE}/tickets/search?query=*&limit=${RECENT_LIMIT}&expand=true&sort_by=updated_at&order_by=DESC" \
        -o "${tmp}" 2>/dev/null && [ -s "${tmp}" ]; then
       mv "${tmp}" "${CACHE_FILE}"
       chmod 600 "${CACHE_FILE}"
