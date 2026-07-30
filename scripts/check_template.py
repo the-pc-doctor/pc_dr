@@ -166,7 +166,26 @@ if proc.returncode:
 elif index.read_bytes() != before:
     errors.append("index.md was stale (regenerated during check - commit the result)")
 
-# 7. Python files parse.
+# 7. Every template on disk is actually tracked.
+#
+# A .gitignore rule that silently swallows a file you meant to publish is a
+# publication defect: `git add -A` reports nothing, the working tree validates
+# cleanly, and the omission only surfaces in a fresh clone - if you look.
+if (ROOT / ".git").exists():
+    tracked = subprocess.run(
+        ["git", "-C", str(ROOT), "ls-files"],
+        capture_output=True, text=True,
+    )
+    if tracked.returncode == 0:
+        tracked_set = set(tracked.stdout.split())
+        for path in sorted(ROOT.rglob("*.tmpl")):
+            if any(part in SKIP_DIRS for part in path.relative_to(ROOT).parts):
+                continue
+            name = rel(path)
+            if name not in tracked_set:
+                errors.append("template not tracked by git (ignored?): %s" % name)
+
+# 8. Python files parse.
 for path in sorted((ROOT / "scripts").glob("*.py")):
     try:
         compile(path.read_text(encoding="utf-8"), str(path), "exec")

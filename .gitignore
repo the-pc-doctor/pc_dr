@@ -17,8 +17,17 @@ out/
 *.crt
 .env
 .env.*
-*credentials*
-*secrets*
+# Narrow, not wildcard. A broad `*credentials*` silently swallowed
+# agent/lib/credentials.sh.tmpl — a legitimate template — and `git add -A`
+# reported nothing. An ignore rule that quietly drops a file you meant to
+# publish is a publication defect, so these name real artifacts only.
+.credentials
+*.credentials
+credentials.json
+credentials.yml
+secrets.json
+secrets.yml
+*.secret
 auth.json
 
 # Live configuration accidentally dropped in the tree.
