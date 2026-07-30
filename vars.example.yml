@@ -103,7 +103,11 @@ ticketing:
   verifier_user: operator@lab.example
   # State the record is set to on handoff. Must be a state that awaits the
   # operator rather than one that ends the record.
-  handoff_state: pending reminder
+  #
+  # NOT "pending reminder": Zammad rejects that state unless a pending_time is
+  # supplied, and the rejection is easy to miss — the note posts fine and only
+  # the state change fails, so the handoff looks like it worked.
+  handoff_state: open
 
 documentation:
   # Durable architecture documentation. Not for transient incident notes.

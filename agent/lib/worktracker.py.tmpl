@@ -382,13 +382,29 @@ def handoff(record_id, summary, verified, not_verified, recommendation):
         summary=summary, verified=verified,
         not_verified=not_verified, recommendation=recommendation), internal=False)
 
-    result = tracker_request("/tickets/%s" % int(record_id), "PUT", {
+    tracker_request("/tickets/%s" % int(record_id), "PUT", {
         "state": HANDOFF_STATE,
         "owner": VERIFIER,
     })
-    print("record %s handed to %s in state %r - the operator verifies and closes"
-          % (record_id, VERIFIER, HANDOFF_STATE))
-    return result
+
+    # Re-read rather than trusting the write. Two ways this silently half-fails:
+    #
+    #   * Some states require an extra field (Zammad rejects "pending reminder"
+    #     without a pending_time). The note posts fine and only the state change
+    #     fails, so the handoff LOOKS successful.
+    #   * The API can accept a write and return a body with none of the fields
+    #     you set.
+    #
+    # The note landing is not evidence the record moved.
+    check = tracker_request("/tickets/%s" % int(record_id))
+    if not isinstance(check, dict) or not check.get("owner_id"):
+        die("handoff could not be confirmed for record %s - re-read failed; "
+            "do NOT report this as handed off" % record_id)
+
+    print("record %s: note posted; owner_id=%s state_id=%s - verify these are the "
+          "intended verifier and a state that awaits them"
+          % (record_id, check.get("owner_id"), check.get("state_id")))
+    return check
 
 
 # --- CLI --------------------------------------------------------------------
