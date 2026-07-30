@@ -1,4 +1,4 @@
-Agent-Operated Homelab Template
+# Agent-Operated Homelab Template
 
 A runtime-neutral template for a **single-board-computer homelab operated by an AI agent**: identity, doctrine, service stacks, watchdogs, monitoring, backup, notification discipline, and scheduled maintenance.
 
